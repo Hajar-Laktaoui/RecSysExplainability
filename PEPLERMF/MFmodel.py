@@ -289,7 +289,7 @@ def train_model(model, train_data, valRatings, valNegatives, num_epochs, batch_s
             print(f'Epoch {epoch + 1}, Step {step // batch_size + 1}, Loss: {loss.item():.4f}')
         scheduler.step()
         #Print the average loss for each epoch.
-        print(f'Epoch {epoch + 1}, Avrg Loss: {np.mean(epoch_loss):.4f}')
+        #print(f'Epoch {epoch + 1}, Avrg Loss: {np.mean(epoch_loss):.4f}')
         '''
         Evaluate the model's performance on validation data at the end of each epoch. 
         - Print the HR and NDCG scores.
