@@ -1,6 +1,7 @@
 import os
 import math
 import torch
+import numpy as np
 import argparse
 from transformers import GPT2Tokenizer, AdamW
 from transformers import GPT2TokenizerFast
@@ -16,12 +17,12 @@ from functools import partial
 from DPOLs import ContinuousPromptLearning
 # from ModuleHistory import ContinuousPromptLearning
 from DPOutils import rouge_score, bleu_score, DataLoader, DataLoader, Batchify, now_time, ids2tokens, ids2tokensReal, unique_sentence_percent, \
-    feature_detect, feature_matching_ratio, feature_coverage_ratio, feature_diversity
+    feature_detect, feature_matching_ratio, feature_coverage_ratio, feature_diversity, seed_everything
 # from utils import rouge_score, bleu_score, DataLoader, Batchify, now_time, ids2tokens, unique_sentence_percent, \
 #     feature_detect, feature_matching_ratio, feature_coverage_ratio, feature_diversity
 
-
-parser = argparse.ArgumentParser(description='PErsonalized Prompt Learning for Explainable Recommendation (PEPLER)')
+os.environ["WANDB_API_KEY"] = "7c0382c84f747e007f12b15329a10ddad3de09d5"
+parser = argparse.ArgumentParser(description='DPO for SFT model')
 parser.add_argument('--data_path', type=str, default=None,
                     help='path for loading the pickle data')
 parser.add_argument('--index_dir', type=str, default=None,
@@ -46,7 +47,15 @@ parser.add_argument('--endure_times', type=int, default=3,
                     help='the maximum endure times of loss increasing on validation')
 parser.add_argument('--words', type=int, default=20,
                     help='number of words to generate for each sample')
+parser.add_argument("--seed", type=int, default=2003)
+
+parser.add_argument("--wandb_project", type=str, default="test-dpo")
+
 args = parser.parse_args()
+seed_everything(args.seed)
+
+wandb.login()
+wandb.init(project=args.wandb_project, config=args)
 
 if args.data_path is None:
     parser.error('--data_path should be provided for loading data')
@@ -67,7 +76,6 @@ if not os.path.exists(args.checkpoint):
     os.makedirs(args.checkpoint)
 model_path = os.path.join(args.checkpoint, 'model.pt')
 prediction_path = os.path.join(args.checkpoint, args.outf)
-
 ###############################################################################
 # Load data
 ###############################################################################
@@ -143,57 +151,127 @@ def get_log_prob(logits, labels):
     log_probs = F.log_softmax(logits, dim=-1)
     return torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1).mean(-1)
 
-def train(model, ref_model, tokenizer, optimizer, train_dataloader, epochs=1, beta=0.1):
+# def train(model, ref_model, tokenizer, optimizer, data, beta=0.1):
+#     model.train()
+#     ref_model.eval()
+#     while True:
+#             batch = data.next_batch()
+#             optimizer.zero_grad()
+
+#             users = batch['user'].to(device)
+#             items = batch['item'].to(device)
+#             ratings = batch['rating'].to(device)
+#             seq = batch['seq'].to(device)
+#             mask = batch['mask'].to(device)
+#             feat = batch['feat'].to(device)
+
+#             prompt_prefered_ids = batch['prompt_prefered_ids'].to(device)
+#             prompt_disprefered_ids = batch['prompt_disprefered_ids'].to(device)
+#             prompt_prefered_mask = batch['prompt_prefered_mask'].to(device)
+#             prompt_disprefered_mask = batch['prompt_disprefered_mask'].to(device)
+
+#             # Forward pass with model
+#             model_prefered_output = model(users, items, prompt_prefered_ids, feat,  mask=prompt_prefered_mask)
+#             model_disprefered_output = model(users, items, prompt_disprefered_ids, feat, mask=prompt_disprefered_mask)
+
+#             # Compute log probabilities
+#             model_prefered_log_prob = get_log_prob(model_prefered_output["logits"], prompt_prefered_ids)
+#             model_disprefered_log_prob = get_log_prob(model_disprefered_output["logits"], prompt_disprefered_ids)
+
+#             # Reference model outputs
+#             ref_prefered_output = ref_model(users, items, prompt_prefered_ids, feat, mask=prompt_prefered_mask)
+#             ref_disprefered_output = ref_model(users, items, prompt_disprefered_ids, feat, mask=prompt_disprefered_mask)
+
+#             ref_prefered_log_prob = get_log_prob(ref_prefered_output["logits"], prompt_prefered_ids)
+#             ref_disprefered_log_prob = get_log_prob(ref_disprefered_output["logits"], prompt_disprefered_ids)
+
+#             # Compute DPO loss
+#             loss, prefered_relative_logprob, disprefered_relative_logprob, reward_accuracies, reward_margins = calculate_DPO_loss(
+#                 model_prefered_log_prob, model_disprefered_log_prob,
+#                 ref_prefered_log_prob, ref_disprefered_log_prob,
+#                 beta=beta)
+
+#             # Backpropagation
+#             loss.backward()
+#             optimizer.step()
+
+#             wandb.log({
+#                 'loss': loss.item(),
+#                 'prefered_relative_logprob': prefered_relative_logprob.mean().item(),
+#                 'disprefered_relative_logprob': disprefered_relative_logprob.mean().item(),
+#                 'reward_accuracy': reward_accuracies.mean().item(),
+#                 'reward_margin': reward_margins.mean().item()
+#             })
+def train(model, ref_model, tokenizer, optimizer, data, beta=0.1):
     model.train()
     ref_model.eval()
+    
+    text_loss = 0.
+    total_sample = 0
 
-     while True::
-        batch = data.next_batch():
-            optimizer.zero_grad()
+    while True:
+        batch = data.next_batch()
+        optimizer.zero_grad()
 
-            users = batch['user'].to(device)
-            items = batch['item'].to(device)
-            ratings = batch['rating'].to(device)
-            seq = batch['seq'].to(device)
-            mask = batch['mask'].to(device)
+        users = batch['user'].to(device)
+        items = batch['item'].to(device)
+        ratings = batch['rating'].to(device)
+        seq = batch['seq'].to(device)
+        mask = batch['mask'].to(device)
+        feat = batch['feat'].to(device)
 
-            prompt_prefered_ids = batch['prompt_prefered_ids'].to(device)
-            prompt_disprefered_ids = batch['prompt_disprefered_ids'].to(device)
-            prompt_prefered_mask = batch['prompt_prefered_mask'].to(device)
-            prompt_disprefered_mask = batch['prompt_disprefered_mask'].to(device)
+        prompt_prefered_ids = batch['prompt_prefered_ids'].to(device)
+        prompt_disprefered_ids = batch['prompt_disprefered_ids'].to(device)
+        prompt_prefered_mask = batch['prompt_prefered_mask'].to(device)
+        prompt_disprefered_mask = batch['prompt_disprefered_mask'].to(device)
 
-            # Forward pass with model
-            model_prefered_output = model(users, items, prompt_prefered_ids, feat=None, mask=prompt_prefered_mask)
-            model_disprefered_output = model(users, items, prompt_disprefered_ids, feat=None, mask=prompt_disprefered_mask)
+        # Forward pass with model
+        model_prefered_output = model(users, items, prompt_prefered_ids, feat,  mask=prompt_prefered_mask)
+        model_disprefered_output = model(users, items, prompt_disprefered_ids, feat, mask=prompt_disprefered_mask)
 
-            # Compute log probabilities
-            model_prefered_log_prob = get_log_prob(model_prefered_output["logits"], prompt_prefered_ids)
-            model_disprefered_log_prob = get_log_prob(model_disprefered_output["logits"], prompt_disprefered_ids)
+        # Compute log probabilities
+        model_prefered_log_prob = get_log_prob(model_prefered_output["logits"], prompt_prefered_ids)
+        model_disprefered_log_prob = get_log_prob(model_disprefered_output["logits"], prompt_disprefered_ids)
 
-            # Reference model outputs
-            ref_prefered_output = ref_model(users, items, prompt_prefered_ids, feat=None, mask=prompt_prefered_mask)
-            ref_disprefered_output = ref_model(users, items, prompt_disprefered_ids, feat=None, mask=prompt_disprefered_mask)
+        # Reference model outputs
+        ref_prefered_output = ref_model(users, items, prompt_prefered_ids, feat, mask=prompt_prefered_mask)
+        ref_disprefered_output = ref_model(users, items, prompt_disprefered_ids, feat, mask=prompt_disprefered_mask)
 
-            ref_prefered_log_prob = get_log_prob(ref_prefered_output["logits"], prompt_prefered_ids)
-            ref_disprefered_log_prob = get_log_prob(ref_disprefered_output["logits"], prompt_disprefered_ids)
+        ref_prefered_log_prob = get_log_prob(ref_prefered_output["logits"], prompt_prefered_ids)
+        ref_disprefered_log_prob = get_log_prob(ref_disprefered_output["logits"], prompt_disprefered_ids)
 
-            # Compute DPO loss
-            loss, prefered_relative_logprob, disprefered_relative_logprob, reward_accuracies, reward_margins = calculate_DPO_loss(
-                model_prefered_log_prob, model_disprefered_log_prob,
-                ref_prefered_log_prob, ref_disprefered_log_prob,
-                beta=beta)
+        # Compute DPO loss
+        loss, prefered_relative_logprob, disprefered_relative_logprob, reward_accuracies, reward_margins = calculate_DPO_loss(
+            model_prefered_log_prob, model_disprefered_log_prob,
+            ref_prefered_log_prob, ref_disprefered_log_prob,
+            beta=beta)
 
-            # Backpropagation
-            loss.backward()
-            optimizer.step()
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
 
-            wandb.log({
-                'loss': loss.item(),
-                'prefered_relative_logprob': prefered_relative_logprob.mean().item(),
-                'disprefered_relative_logprob': disprefered_relative_logprob.mean().item(),
-                'reward_accuracy': reward_accuracies.mean().item(),
-                'reward_margin': reward_margins.mean().item()
-            })
+        batch_size = users.size(0)
+        text_loss += batch_size * loss.item()
+        total_sample += batch_size
+
+        # Interval-based logging
+        if data.step % args.log_interval == 0 or data.step == data.total_step:
+            cur_t_loss = text_loss / total_sample
+            print(now_time() + 'DPO loss {:4.4f} | {:5d}/{:5d} batches'.format(cur_t_loss, data.step, data.total_step))
+            text_loss = 0.
+            total_sample = 0
+        
+        # Log additional metrics using wandb
+        wandb.log({
+            'loss': loss.item(),
+            'prefered_relative_logprob': prefered_relative_logprob.mean().item(),
+            'disprefered_relative_logprob': disprefered_relative_logprob.mean().item(),
+            'reward_accuracy': reward_accuracies.mean().item(),
+            'reward_margin': reward_margins.mean().item()
+        })
+
+        if data.step == data.total_step:
+            break
 
 
 def evaluate(data):
@@ -207,8 +285,9 @@ def evaluate(data):
             items = batch['item'].to(device)
             seq = batch['seq'].to(device)
             mask = batch['mask'].to(device)
+            feat = batch['feat'].to(device)
 
-            outputs = model(users, items, seq, None, mask)
+            outputs = model(users, items, seq, feat, mask)
             loss = outputs.loss
 
             batch_size = users.size(0)
@@ -231,10 +310,10 @@ def generate(data):
             users = batch['user'].to(device)
             items = batch['item'].to(device)
             seq = batch['seq'].to(device)
-
+            feat = batch['feat'].to(device)
             text = seq[:, :1].to(device)  # Start with <bos>
             for idx in range(seq.size(1)):
-                outputs = model(users, items, text, None, None)
+                outputs = model(users, items, text, feat, None)
                 last_token = outputs.logits[:, -1, :]
                 word_prob = torch.softmax(last_token, dim=-1)
                 token = torch.argmax(word_prob, dim=1, keepdim=True)
@@ -250,6 +329,7 @@ def generate(data):
 
 
 print(now_time() + 'Tuning Prompt Only')
+# wandb.init(project="DPO_training", entity="DPOTripAdvisor")
 # Loop over epochs.
 best_val_loss = float('inf')
 endure_count = 0
