@@ -8,6 +8,7 @@ import datetime
 from rouge import rouge
 from bleu import compute_bleu
 import json
+import numpy as np
 
 
 def rouge_score(references, generated):
@@ -146,7 +147,7 @@ class DataLoader:
         self.feature_set = set()
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.DPOdataset = '/home/hajar.laktaoui/lustre/robust_ml-um6p-st-sccs-iqcbvkbobtq/users/hajar.laktaoui/Implementation4TkL/PEPLERSASRec/DPOTripAdvisorAlldataset.json'
+        self.DPOdataset = '/home/hajar.laktaoui/lustre/robust_ml-um6p-st-sccs-iqcbvkbobtq/users/hajar.laktaoui/Implementation4TkL/PEPLERSASRec/TripAdvisorDPOoutput.json'
         self.train, self.valid, self.test, self.user2feature, self.item2feature = self.load_data(data_path, index_dir)
 
     def initialize(self, data_path):
@@ -180,13 +181,11 @@ class DataLoader:
         for review in reviews:
             user_id = review.get('user')
             item_id = review.get('item')
-
             user_meta = user_DPOdataset.get(user_id, {})
             item_meta = item_DPOdataset.get(item_id, {})
 
             chosen = user_meta.get('chosen', item_meta.get('chosen', ''))
             rejected = user_meta.get('rejected', item_meta.get('rejected', ''))
-            
             (fea, adj, tem, sco) = review['template']
             tokens = self.tokenizer(tem)['input_ids']
             text = self.tokenizer.decode(tokens[:self.seq_len])  # keep seq_len tokens at most
@@ -221,7 +220,13 @@ class DataLoader:
         for idx in test_index:
             test.append(data[idx])
         return train, valid, test, user2feature, item2feature
-
+#  Debug: Ensure `chosen` and `rejected` match `user_id` and `item_id`
+            # if chosen and rejected:
+            #     print(f"\n[CHECK] User: {user_id} | Item: {item_id}")
+            #     print(f"✔️ Chosen Response: {chosen[:100]}")  # Print first 100 chars
+            #     print(f"❌ Rejected Response: {rejected[:100]}")
+            # else:
+            #     print(f"⚠️ WARNING: No chosen/rejected for User {user_id}, Item {item_id}")
     def load_index(self, index_dir):
         assert os.path.exists(index_dir)
         with open(os.path.join(index_dir, 'train.index'), 'r') as f:
@@ -236,32 +241,36 @@ class Batchify:
     def __init__(self, data, user2feature, item2feature, tokenizer, bos, eos, seq_len, batch_size=128, shuffle=False):
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.tokenizer = tokenizer  # <-- THIS LINE WAS MISSING
+        self.seq_len = seq_len      # <-- Ensure this exists
         # self.device = device
         self.step = 0
 
-        self.user, self.item, self.rating, t = [], [], [], []
+        self.user, self.item, self.rating, t, f, featuresall, self.feature = [], [], [], [], [],[], []
         self.context, self.prompts = [], []
         self.chosen_responses, self.rejected_responses = [], []
 
+        self.user, self.item, self.rating = [], [], []
+        self.prompts_raw, self.chosen_raw, self.rejected_raw = [], [], []
+        self.seq, self.mask, self.featuresall, self.context = [], [], [], []
+
         for x in data:
-            # Extract user and item features
-            ufea = set(user2feature.get(x['user'], []))
-            ifea = set(item2feature.get(x['item'], []))
+            ufea = set(user2feature[x['user']])
+            ifea = set(item2feature[x['item']])
             intersection = ufea & ifea  # Common features
+            f.append(' '.join(list(intersection)))
             t.append('{} {} {}'.format(bos, x['text'], eos))
+            self.feature.append(x['feature']) 
             # Construct structured prompt
+            # Construct prompt and store raw responses
             prompt_text = f"Instruct: The reason why we recommend the item with the ID {x['item']} to the user that has the ID {x['user']} is:\n"
-            self.prompts.append(prompt_text)
-
-            # Store chosen and rejected responses
-            self.chosen_responses.append(f"Output: {x['chosen']}")
-            self.rejected_responses.append(f"Output: {x['rejected']}")
-
+            self.prompts_raw.append(prompt_text)
+            self.chosen_raw.append(x['chosen'])
+            self.rejected_raw.append(x['rejected'])
             # Store user-item info
             self.user.append(x['user'])
             self.item.append(x['item'])
             self.rating.append(x['rating'])
-
             # Handle metadata
             if isinstance(x.get('metadata'), torch.Tensor):
                 self.context.append(x['metadata'].view(-1))
@@ -275,6 +284,8 @@ class Batchify:
         encoded_inputs = tokenizer(t, padding=True, return_tensors='pt', truncation=True, max_length=seq_len)
         self.seq = encoded_inputs['input_ids'].contiguous()
         self.mask = encoded_inputs['attention_mask'].contiguous()
+        encoded_features = tokenizer(f, padding=True, return_tensors='pt', truncation=True, max_length=seq_len)
+        self.featuresall = encoded_features['input_ids'].contiguous()
         # Ensure metadata tensor consistency
         max_metadata_length = 200  # Set a max length for metadata
         self.context = [
@@ -287,36 +298,6 @@ class Batchify:
         self.sample_num = len(data)
         self.index_list = list(range(self.sample_num))
         self.total_step = int(math.ceil(self.sample_num / self.batch_size))
-
-        # Tokenization
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-
-        # Pre-tokenize prompts & responses
-        self._tokenize_inputs()
-
-    def _tokenize_inputs(self):
-        """Pre-tokenize prompts, chosen responses, and rejected responses."""
-        self.prompt_ids = self.tokenizer.batch_encode_plus(
-            self.prompts, padding=True, return_tensors="pt", max_length=self.seq_len, truncation=True
-        )['input_ids']
-
-        prefered_ids = self.tokenizer.batch_encode_plus(
-            self.chosen_responses, padding=True, return_tensors="pt", max_length=self.seq_len, truncation=True
-        )['input_ids']
-
-        disprefered_ids = self.tokenizer.batch_encode_plus(
-            self.rejected_responses, padding=True, return_tensors="pt", max_length=self.seq_len, truncation=True
-        )['input_ids']
-
-        # Concatenate prompt with responses
-        self.prompt_prefered_ids = torch.cat([self.prompt_ids, prefered_ids], dim=-1)
-        self.prompt_disprefered_ids = torch.cat([self.prompt_ids, disprefered_ids], dim=-1)
-
-        # Create attention masks
-        self.prompt_prefered_mask = torch.cat([torch.ones_like(self.prompt_ids), torch.zeros_like(prefered_ids)], dim=-1)
-        self.prompt_disprefered_mask = torch.cat([torch.ones_like(self.prompt_ids), torch.zeros_like(disprefered_ids)], dim=-1)
-
     def next_batch(self):
         if self.step == self.total_step:
             self.step = 0
@@ -326,106 +307,55 @@ class Batchify:
         start = self.step * self.batch_size
         offset = min(start + self.batch_size, self.sample_num)
         self.step += 1
-        index = self.index_list[start:offset]
+        # index = self.index_list[start:offset]
+        indices = self.index_list[start:offset]
+        # Process DPO data dynamically
+        batch_prompts = [self.prompts_raw[i] for i in indices]
+        chosen_responses = ['Output: ' + self.chosen_raw[i] for i in indices]
+        rejected_responses = ['Output: ' + self.rejected_raw[i] for i in indices]
+
+        # Tokenize components
+        prompt_ids = self.tokenizer.batch_encode_plus(
+            batch_prompts, padding=True, return_tensors="pt", 
+            max_length=self.seq_len, truncation=True
+        )['input_ids']
+
+        chosen_ids = self.tokenizer.batch_encode_plus(
+            chosen_responses, padding=True, return_tensors="pt",
+            max_length=self.seq_len, truncation=True
+        )['input_ids']
+
+        rejected_ids = self.tokenizer.batch_encode_plus(
+            rejected_responses, padding=True, return_tensors="pt",
+            max_length=self.seq_len, truncation=True
+        )['input_ids']
+
+        # Concatenate and create masks
+        prompt_chosen = torch.cat([prompt_ids, chosen_ids], dim=-1)
+        prompt_rejected = torch.cat([prompt_ids, rejected_ids], dim=-1)
+        
+        mask_chosen = torch.cat([
+            torch.ones_like(prompt_ids), 
+            torch.zeros_like(chosen_ids)
+        ], dim=-1)
+        
+        mask_rejected = torch.cat([
+            torch.ones_like(prompt_ids),
+            torch.zeros_like(rejected_ids)
+        ], dim=-1)
 
         return {
-            'user': self.user[index],
-            'item': self.item[index],
-            'rating': self.rating[index],
-            'seq': self.seq[index],
-            'mask': self.mask[index],
-            'prompt_prefered_ids': self.prompt_prefered_ids[index],
-            'prompt_disprefered_ids': self.prompt_disprefered_ids[index],
-            'prompt_prefered_mask': self.prompt_prefered_mask[index],
-            'prompt_disprefered_mask': self.prompt_disprefered_mask[index]
+            'user': self.user[indices],
+            'item': self.item[indices],
+            'rating': self.rating[indices],
+            'seq': self.seq[indices],
+            'feat': self.featuresall[indices],
+            'mask': self.mask[indices],
+            'prompt_prefered_ids': prompt_chosen,
+            'prompt_disprefered_ids': prompt_rejected,
+            'prompt_prefered_mask': mask_chosen,
+            'prompt_disprefered_mask': mask_rejected
         }
-# class Batchify:
-#     def __init__(self, data, user2feature, item2feature, tokenizer, bos, eos, seq_len, batch_size=128, shuffle=False):
-#         u, i, r, t, features, self.context, chosen_responses, rejected_responses = [], [], [], [], [], [], [], []
-
-#         for x in data:
-#             # Extract user and item features
-#             ufea = set(user2feature[x['user']])
-#             ifea = set(item2feature[x['item']])
-#             intersection = ufea & ifea  # Common features
-#             features.append(' '.join(list(intersection)))
-
-#             # Extract chosen and rejected responses
-#             chosen_responses.append('Output: ' + x['chosen'])
-#             rejected_responses.append('Output: ' + x['rejected'])
-
-#             u.append(x['user'])
-#             i.append(x['item'])
-#             r.append(x['rating'])
-#             t.append('{} {} {}'.format(bos, x['text'], eos))
-
-#             if isinstance(x['metadata'], torch.Tensor):
-#                 self.context.append(x['metadata'].view(-1))
-#             else:
-#                 self.context.append(torch.tensor(x['metadata'], dtype=torch.long))
-
-#         # Tokenize text and features
-#         encoded_inputs = tokenizer(t, padding=True, return_tensors='pt', truncation=True, max_length=seq_len)
-#         self.seq = encoded_inputs['input_ids'].contiguous()
-#         self.mask = encoded_inputs['attention_mask'].contiguous()
-#         self.user = torch.tensor(u, dtype=torch.int64).contiguous()
-#         self.item = torch.tensor(i, dtype=torch.int64).contiguous()
-#         self.rating = torch.tensor(r, dtype=torch.float).contiguous()
-
-#         # Tokenize chosen and rejected responses
-#         prefered_ids = tokenizer(chosen_responses, padding=True, return_tensors='pt', truncation=True, max_length=seq_len)['input_ids']
-#         disprefered_ids = tokenizer(rejected_responses, padding=True, return_tensors='pt', truncation=True, max_length=seq_len)['input_ids']
-
-#         # Combine prompts with responses
-#         self.prompt_prefered_ids = torch.cat([self.prompt, prefered_ids], dim=-1)
-#         self.prompt_disprefered_ids = torch.cat([self.prompt, disprefered_ids], dim=-1)
-
-#         # Create attention masks
-#         self.prompt_prefered_mask = torch.cat([torch.ones_like(self.prompt), torch.zeros_like(prefered_ids)], dim=-1)
-#         self.prompt_disprefered_mask = torch.cat([torch.ones_like(self.prompt), torch.zeros_like(disprefered_ids)], dim=-1)
-
-#         # Ensure metadata tensor consistency
-#         max_metadata_length = 200  # Set a max length for metadata
-#         self.context = [
-#             torch.cat([c, torch.zeros(max_metadata_length - len(c), dtype=torch.long)]) if len(c) < max_metadata_length else c[:max_metadata_length]
-#             for c in self.context
-#         ]
-#         self.context = torch.stack(self.context)  # Convert list to tensor
-
-#         self.shuffle = shuffle
-#         self.batch_size = batch_size
-#         self.sample_num = len(data)
-#         self.index_list = list(range(self.sample_num))
-#         self.total_step = int(math.ceil(self.sample_num / self.batch_size))
-#         self.step = 0
-
-#     def next_batch(self):
-#         if self.step == self.total_step:
-#             self.step = 0
-#             if self.shuffle:
-#                 random.shuffle(self.index_list)
-
-#         start = self.step * self.batch_size
-#         offset = min(start + self.batch_size, self.sample_num)
-#         self.step += 1
-#         index = self.index_list[start:offset]
-
-#         # Prepare batch outputs
-#         user = self.user[index]
-#         item = self.item[index]
-#         rating = self.rating[index]
-#         seq = self.seq[index]
-#         feat = self.prompt[index]
-#         mask = self.mask[index]
-#         context = self.context[index]
-#         prompt_prefered_ids = self.prompt_prefered_ids[index]
-#         prompt_disprefered_ids = self.prompt_disprefered_ids[index]
-#         prompt_prefered_mask = self.prompt_prefered_mask[index]
-#         prompt_disprefered_mask = self.prompt_disprefered_mask[index]
-
-#         return (user, item, rating, seq, feat, mask, context,
-#                 prompt_prefered_ids, prompt_disprefered_ids, prompt_prefered_mask, prompt_disprefered_mask)
-
 
 class Batchify2:
     def __init__(self, data, user2feature, item2feature, tokenizer, bos, eos, seq_len, batch_size=128, shuffle=False):
@@ -433,6 +363,8 @@ class Batchify2:
         for x in data:
             ufea = set(user2feature[x['user']])
             ifea = set(item2feature[x['item']])
+            print(ufea)
+            print(ifea)
             intersection = ufea & ifea
             difference = ufea | ifea - intersection
             features.append(' '.join(list(intersection) + list(difference)))
@@ -513,37 +445,10 @@ def ids2tokensReal(ids, tokenizer, eos_token="<eos>", pad_token="<pad>"):
             break
         tokens.append(token)
     return tokens
-"""
-def ids2tokensReal(ids, tokenizer, eos_token="<eos>", pad_token="<pad>"):
-    text = tokenizer.decode(ids)
-    text = postprocessing(text)  # process punctuations: "good!" -> "good !"
-    tokens = []
-    # for token in text.split():
-    for token in re.findall(f"{eos_token}|{pad_token}|[^\s<]+", text):
-        if token == eos_token:
-            break
-        tokens.append(token)
-    return tokens
+def seed_everything(seed=2003):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
 
-# def ids2tokens(ids, tokenizer, eos):
-#     text = tokenizer.decode(ids)
-#     text = postprocessing(text)  # process punctuations: "good!" -> "good !"
-#     tokens = []
-#     for token in text.split():
-#         if token == eos:
-#             break
-#         tokens.append(token)
-#     return tokens
-def ids2tokens(ids, tokenizer, eos):
-    text = tokenizer.decode(ids)
-    text = postprocessing(text)  # process punctuations: "good!" -> "good !"
-    tokens = []
-    for token in text.split():
-        if token == eos:
-            break
-        tokens.append(token)
-    return tokens
-# encoded_features = tokenizer(features, padding=True, return_tensors='pt', truncation=True, max_length=seq_len)
-        # self.prompt = encoded_features['input_ids'].contiguous()
-
-"""
